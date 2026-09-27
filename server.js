@@ -1,32 +1,42 @@
-const express = require('express');
-const cors = require('cors');
 require('dotenv').config();
-
-// Import routes
-const apiRoutes = require('./routes/api');
+const express = require('express');
+const mysql = require('mysql2/promise');
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
+app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors()); // Allows cross-origin requests
-app.use(express.json()); // Parses incoming JSON requests
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT || 3306,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-// Basic health check route
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/db-test', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT 1 + 1 AS result');
+    res.json({ success: true, result: rows[0].result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
-  res.json({ message: 'Welcome to the Frontyre Backend API!' });
+  res.json({ message: 'FrontHyre API is running' });
 });
 
-// Use API routes
-app.use('/api', apiRoutes);
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!' });
-});
-
-// Start the server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
 });
