@@ -4,6 +4,9 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 
 const app = express();
+// Import routes
+const apiRoutes = require('./routes/api');
+
 app.use(cors());
 app.use(express.json());
 
@@ -20,6 +23,7 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+app.use('/api', apiRoutes);
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
