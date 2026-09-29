@@ -1,0 +1,41 @@
+name: Deploy to AWS ASG
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Verify AWS access (STS GetCallerIdentity)
+        run: aws sts get-caller-identity
+
+      - name: Display current launch template version
+        run: |
+          aws ec2 describe-launch-template-versions \
+            --launch-template-name frontyre-api-template \
+            --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].{Version:VersionNumber,ImageId:LaunchTemplateData.ImageId,InstanceType:LaunchTemplateData.InstanceType}' \
+            --output table
+
+      - name: Display current ASG status
+        run: |
+          aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names frontyre-asg \
+            --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Min:MinSize,Max:MaxSize,Health:length(Instances[?HealthStatus==`Healthy`])}' \
+            --output table
