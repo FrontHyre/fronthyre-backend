@@ -60,27 +60,27 @@ jobs:
           echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
 
       - name: Setup SSH key
+        env:
+          SSH_KEY_CONTENT: ${{ secrets.SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy-key.pem
+          echo "$SSH_KEY_CONTENT" > ~/.ssh/deploy-key.pem
           chmod 600 ~/.ssh/deploy-key.pem
           ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Deploy code to builder
         run: |
           ssh -i ~/.ssh/deploy-key.pem -o StrictHostKeyChecking=no \
-            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} << 'ENDSSH'
-            set -e
-            cd ~/fronthyre-backend
-            git fetch origin
-            git reset --hard origin/main
-            npm install --omit=dev
-            pm2 delete all || true
-            pm2 start server.js --name frontyre-api
-            pm2 save
-            sleep 5
-            curl -sf http://localhost:3000/health || (echo "Health check failed" && exit 1)
-          ENDSSH
+            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
+            "cd ~/fronthyre-backend && \
+             git fetch origin && \
+             git reset --hard origin/main && \
+             npm install --omit=dev && \
+             (pm2 delete all || true) && \
+             pm2 start server.js --name frontyre-api && \
+             pm2 save && \
+             sleep 5 && \
+             curl -sf http://localhost:3000/health"
 
       - name: Stop builder for clean AMI
         run: |
