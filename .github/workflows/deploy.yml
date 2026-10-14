@@ -1,4 +1,4 @@
-name: Deploy to AWS ASG
+name: Build AMI and Deploy to ASG
 
 on:
   push:
@@ -9,40 +9,156 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Debug OIDC token claims
-        run: |
-          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          echo "===== DECODED TOKEN PAYLOAD ====="
-          echo "$TOKEN" | cut -d '.' -f 2 | base64 -d 2>/dev/null | jq .
-
-      - name: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS access (STS GetCallerIdentity)
+      - name: Verify AWS access
         run: aws sts get-caller-identity
 
-      - name: Display current launch template version
+      - name: Launch builder EC2 instance
+        id: launch
         run: |
-          aws ec2 describe-launch-template-versions \
-            --launch-template-name frontyre-api-template \
-            --versions '$Latest' \
-            --query 'LaunchTemplateVersions[0].{Version:VersionNumber,ImageId:LaunchTemplateData.ImageId,InstanceType:LaunchTemplateData.InstanceType}' \
-            --output table
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ secrets.AMI_BASE_ID }} \
+            --instance-type t3.micro \
+            --key-name frontyre-key \
+            --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
+            --subnet-id ${{ secrets.SUBNET_ID }} \
+            --iam-instance-profile Name=${{ secrets.IAM_PROFILE_NAME }} \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ci-builder}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-      - name: Display current ASG status
+      - name: Wait for instance to be running
         run: |
-          aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names frontyre-asg \
-            --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Min:MinSize,Max:MaxSize,Health:length(Instances[?HealthStatus==`Healthy`])}' \
-            --output table
+          aws ec2 wait instance-running --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
+          aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
+
+      - name: Get instance public IP
+        id: ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/deploy-key.pem
+          chmod 600 ~/.ssh/deploy-key.pem
+          ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy code to builder
+        run: |
+          ssh -i ~/.ssh/deploy-key.pem -o StrictHostKeyChecking=no \
+            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} << 'ENDSSH'
+            set -e
+            cd ~/fronthyre-backend
+            git fetch origin
+            git reset --hard origin/main
+            npm install --omit=dev
+            pm2 delete all || true
+            pm2 start server.js --name frontyre-api
+            pm2 save
+            sleep 5
+            curl -sf http://localhost:3000/health || (echo "Health check failed" && exit 1)
+          ENDSSH
+
+      - name: Stop builder for clean AMI
+        run: |
+          ssh -i ~/.ssh/deploy-key.pem -o StrictHostKeyChecking=no \
+            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
+            "sudo shutdown -h now" || true
+          sleep 20
+          aws ec2 wait instance-stopped --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
+
+      - name: Create new AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ec2 create-image \
+            --instance-id ${{ steps.launch.outputs.INSTANCE_ID }} \
+            --name "fronthyre-api-ami-$(date +%Y%m%d-%H%M%S)" \
+            --description "CI build from ${{ github.sha }}" \
+            --no-reboot \
+            --query 'ImageId' \
+            --output text)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for AMI
+        run: |
+          aws ec2 wait image-available --image-ids ${{ steps.ami.outputs.AMI_ID }}
+
+      - name: Get current Launch Template version
+        id: lt
+        run: |
+          LATEST_VER=$(aws ec2 describe-launch-template-versions \
+            --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} \
+            --versions '$Latest' \
+            --query 'LaunchTemplateVersions[0].VersionNumber' \
+            --output text)
+          echo "LATEST_VER=$LATEST_VER" >> $GITHUB_OUTPUT
+
+      - name: Create new Launch Template version
+        id: newlt
+        run: |
+          NEW_VER=$(aws ec2 create-launch-template-version \
+            --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} \
+            --source-version ${{ steps.lt.outputs.LATEST_VER }} \
+            --launch-template-data "{\"ImageId\":\"${{ steps.ami.outputs.AMI_ID }}\"}" \
+            --query 'LaunchTemplateVersion.VersionNumber' \
+            --output text)
+          echo "NEW_VER=$NEW_VER" >> $GITHUB_OUTPUT
+
+      - name: Set new version as default
+        run: |
+          aws ec2 modify-launch-template \
+            --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} \
+            --default-version ${{ steps.newlt.outputs.NEW_VER }}
+
+      - name: Start Instance Refresh
+        id: refresh
+        run: |
+          REFRESH_ID=$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}' \
+            --query 'InstanceRefreshId' \
+            --output text)
+          echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Instance Refresh
+        run: |
+          for i in {1..60}; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
+              --instance-refresh-ids ${{ steps.refresh.outputs.REFRESH_ID }} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+            echo "Attempt $i: Status = $STATUS"
+            if [ "$STATUS" = "Successful" ]; then exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then exit 1; fi
+            sleep 30
+          done
+          exit 1
+
+      - name: Terminate builder instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} || true
