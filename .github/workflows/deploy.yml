@@ -101,15 +101,14 @@ jobs:
       # =========================================================
       - name: Setup SSH key
         env:
-          SSH_KEY_CONTENT: ${{ secrets.SSH_KEY }}
+          SSH_KEY_BASE64: ${{ secrets.SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_KEY_CONTENT" > ~/.ssh/deploy-key.pem
+          echo "$SSH_KEY_BASE64" | base64 -d > ~/.ssh/deploy-key.pem
           chmod 600 ~/.ssh/deploy-key.pem
           ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "✅ SSH key setup complete"
-          echo "--- Verifying key file ---"
-          ls -la ~/.ssh/deploy-key.pem
+          echo "--- Key file size: $(wc -c < ~/.ssh/deploy-key.pem) bytes ---"
           head -1 ~/.ssh/deploy-key.pem
           tail -1 ~/.ssh/deploy-key.pem
 
