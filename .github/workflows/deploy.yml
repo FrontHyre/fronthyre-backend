@@ -104,11 +104,12 @@ jobs:
           SSH_KEY_BASE64: ${{ secrets.SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "$SSH_KEY_BASE64" | base64 -d > ~/.ssh/deploy-key.pem
+          CLEAN_B64=$(echo "$SSH_KEY_BASE64" | tr -d '\n\r\t ')
+          echo "Base64 length after cleanup: ${#CLEAN_B64} chars"
+          echo "$CLEAN_B64" | base64 -d > ~/.ssh/deploy-key.pem
           chmod 600 ~/.ssh/deploy-key.pem
           ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "✅ SSH key setup complete"
-          echo "--- Key file size: $(wc -c < ~/.ssh/deploy-key.pem) bytes ---"
+          echo "--- Decoded key size: $(wc -c < ~/.ssh/deploy-key.pem) bytes ---"
           head -1 ~/.ssh/deploy-key.pem
           tail -1 ~/.ssh/deploy-key.pem
 
