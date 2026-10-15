@@ -15,7 +15,7 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout code
@@ -28,8 +28,13 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS access
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
+          echo "AWS access verified"
 
+      # =========================================================
+      # STEP 1: Launch a temporary builder instance from the base AMI
+      # =========================================================
       - name: Launch builder EC2 instance
         id: launch
         run: |
@@ -39,71 +44,149 @@ jobs:
             --key-name frontyre-key \
             --security-group-ids ${{ secrets.SECURITY_GROUP_ID }} \
             --subnet-id ${{ secrets.SUBNET_ID }} \
+            --associate-public-ip-address \
             --iam-instance-profile Name=${{ secrets.IAM_PROFILE_NAME }} \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ci-builder}]' \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ci-builder},{Key=Environment,Value=ci}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Launched builder instance: $INSTANCE_ID"
 
-      - name: Wait for instance
+      - name: Wait for instance to be running
         run: |
           aws ec2 wait instance-running --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
           aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
+          echo "✅ Instance is running and status checks passed"
 
       - name: Get instance public IP
         id: ip
         run: |
-          IP=$(aws ec2 describe-instances \
-            --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
+          echo "Waiting for public IP assignment..."
+          IP=""
+          for i in {1..18}; do
+            IP=$(aws ec2 describe-instances \
+              --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            echo "Attempt $i: IP = $IP"
+            if [ "$IP" != "None" ] && [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "✅ Got public IP: $IP"
+              break
+            fi
+            sleep 10
+          done
+          if [ "$IP" = "None" ] || [ -z "$IP" ] || [ "$IP" = "null" ]; then
+            echo "❌ ERROR: Could not get public IP after 3 minutes"
+            echo "Instance may not be in a public subnet, or Auto-assign public IP is disabled."
+            exit 1
+          fi
           echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
 
+      - name: Wait for SSH port 22 to be ready
+        run: |
+          echo "Waiting for SSH to be ready on ${{ steps.ip.outputs.PUBLIC_IP }}..."
+          for i in {1..20}; do
+            if nc -zvw3 ${{ steps.ip.outputs.PUBLIC_IP }} 22 2>/dev/null; then
+              echo "✅ SSH port 22 is open"
+              exit 0
+            fi
+            echo "Attempt $i: SSH not ready, waiting..."
+            sleep 10
+          done
+          echo "❌ SSH never became ready"
+          exit 1
+
+      # =========================================================
+      # STEP 2: Setup SSH credentials
+      # =========================================================
       - name: Setup SSH key
         env:
           SSH_KEY_CONTENT: ${{ secrets.SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "$SSH_KEY_CONTENT" > ~/.ssh/deploy-key.pem
+          printf '%s\n' "$SSH_KEY_CONTENT" > ~/.ssh/deploy-key.pem
           chmod 600 ~/.ssh/deploy-key.pem
           ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "SSH setup complete"
-          ls -la ~/.ssh/ | head
+          echo "✅ SSH key setup complete"
+          echo "--- Verifying key file ---"
+          ls -la ~/.ssh/deploy-key.pem
+          head -1 ~/.ssh/deploy-key.pem
+          tail -1 ~/.ssh/deploy-key.pem
 
+      # =========================================================
+      # STEP 3: Deploy latest code to the builder instance
+      # =========================================================
       - name: Deploy code to builder
         run: |
+          if [ -z "${{ steps.ip.outputs.PUBLIC_IP }}" ]; then
+            echo "❌ ERROR: PUBLIC_IP is empty. Cannot SSH."
+            exit 1
+          fi
           ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=30 \
               -i ~/.ssh/deploy-key.pem \
               ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
-              "cd ~/fronthyre-backend && git fetch origin && git reset --hard origin/main && npm install --omit=dev && (pm2 delete all || true) && pm2 start server.js --name frontyre-api && pm2 save && sleep 5 && curl -sf http://localhost:3000/health"
+              "set -e && \
+               cd ~/fronthyre-backend && \
+               git fetch origin && \
+               git reset --hard origin/main && \
+               npm install --omit=dev && \
+               (pm2 delete all || true) && \
+               pm2 start server.js --name frontyre-api --update-env && \
+               pm2 save && \
+               sleep 5 && \
+               curl -sf http://localhost:3000/health && \
+               echo 'DEPLOY_OK'"
+          echo "✅ Code deployed to builder instance"
 
-      - name: Stop builder for clean AMI
+      # =========================================================
+      # STEP 4: Stop the builder for a clean AMI
+      # =========================================================
+      - name: Stop builder instance
         run: |
-          ssh -o StrictHostKeyChecking=no \
-              -i ~/.ssh/deploy-key.pem \
-              ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
-              "sudo shutdown -h now" || true
-          sleep 20
+          if [ -z "${{ steps.ip.outputs.PUBLIC_IP }}" ]; then
+            echo "⚠️ No IP, skipping shutdown command"
+          else
+            ssh -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=30 \
+                -i ~/.ssh/deploy-key.pem \
+                ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
+                "sudo shutdown -h now" || true
+          fi
+          echo "Waiting for instance to fully stop..."
+          sleep 30
           aws ec2 wait instance-stopped --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} || true
+          echo "✅ Builder instance stopped"
 
+      # =========================================================
+      # STEP 5: Create AMI from the stopped builder instance
+      # =========================================================
       - name: Create new AMI
         id: ami
         run: |
+          AMI_NAME="fronthyre-api-ami-$(date +%Y%m%d-%H%M%S)"
           AMI_ID=$(aws ec2 create-image \
             --instance-id ${{ steps.launch.outputs.INSTANCE_ID }} \
-            --name "fronthyre-api-ami-$(date +%Y%m%d-%H%M%S)" \
-            --description "CI build from ${{ github.sha }}" \
+            --name "$AMI_NAME" \
+            --description "CI build from commit ${{ github.sha }}" \
             --no-reboot \
             --query 'ImageId' \
             --output text)
           echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
-          echo "Created AMI: $AMI_ID"
+          echo "AMI_NAME=$AMI_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Created AMI: $AMI_ID ($AMI_NAME)"
 
-      - name: Wait for AMI
+      - name: Wait for AMI to be available
         run: |
+          echo "Waiting for AMI ${{ steps.ami.outputs.AMI_ID }} to become available..."
           aws ec2 wait image-available --image-ids ${{ steps.ami.outputs.AMI_ID }}
+          echo "✅ AMI is available"
 
-      - name: Get current LT version
+      # =========================================================
+      # STEP 6: Update Launch Template with the new AMI
+      # =========================================================
+      - name: Get current Launch Template version
         id: lt
         run: |
           LATEST_VER=$(aws ec2 describe-launch-template-versions \
@@ -112,8 +195,9 @@ jobs:
             --query 'LaunchTemplateVersions[0].VersionNumber' \
             --output text)
           echo "LATEST_VER=$LATEST_VER" >> $GITHUB_OUTPUT
+          echo "✅ Current LT version: $LATEST_VER"
 
-      - name: Create new LT version
+      - name: Create new Launch Template version
         id: newlt
         run: |
           NEW_VER=$(aws ec2 create-launch-template-version \
@@ -123,39 +207,77 @@ jobs:
             --query 'LaunchTemplateVersion.VersionNumber' \
             --output text)
           echo "NEW_VER=$NEW_VER" >> $GITHUB_OUTPUT
+          echo "✅ New LT version: $NEW_VER"
 
       - name: Set new version as default
         run: |
           aws ec2 modify-launch-template \
             --launch-template-name ${{ secrets.LAUNCH_TEMPLATE_NAME }} \
             --default-version ${{ steps.newlt.outputs.NEW_VER }}
+          echo "✅ LT version ${{ steps.newlt.outputs.NEW_VER }} set as default"
 
+      # =========================================================
+      # STEP 7: Trigger ASG Instance Refresh (rolling deploy)
+      # =========================================================
       - name: Start Instance Refresh
         id: refresh
         run: |
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}' \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120, "SkipMatching": false}' \
             --query 'InstanceRefreshId' \
             --output text)
           echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_OUTPUT
+          echo "✅ Instance Refresh started: $REFRESH_ID"
 
-      - name: Wait for Instance Refresh
+      - name: Wait for Instance Refresh to complete
         run: |
-          for i in {1..60}; do
-            STATUS=$(aws autoscaling describe-instance-refreshes \
+          echo "Monitoring Instance Refresh..."
+          for i in {1..80}; do
+            RESULT=$(aws autoscaling describe-instance-refreshes \
               --auto-scaling-group-name ${{ secrets.ASG_NAME }} \
               --instance-refresh-ids ${{ steps.refresh.outputs.REFRESH_ID }} \
-              --query 'InstanceRefreshes[0].Status' \
+              --query 'InstanceRefreshes[0].[Status,PercentageComplete]' \
               --output text)
-            echo "Attempt $i: Status = $STATUS"
-            if [ "$STATUS" = "Successful" ]; then exit 0; fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then exit 1; fi
+            STATUS=$(echo $RESULT | awk '{print $1}')
+            PCT=$(echo $RESULT | awk '{print $2}')
+            echo "Attempt $i: Status=$STATUS, Progress=${PCT}%"
+            if [ "$STATUS" = "Successful" ]; then
+              echo "✅ Instance Refresh completed successfully"
+              exit 0
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "❌ Instance Refresh ended with status: $STATUS"
+              exit 1
+            fi
             sleep 30
           done
+          echo "⚠️ Timeout waiting for Instance Refresh — check ASG manually"
           exit 1
 
+      # =========================================================
+      # STEP 8: Cleanup — always terminate the builder instance
+      # =========================================================
       - name: Terminate builder instance
         if: always()
         run: |
-          aws ec2 terminate-instances --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} || true
+          echo "Cleaning up builder instance..."
+          aws ec2 terminate-instances \
+            --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} || true
+          echo "✅ Builder instance terminated"
+
+      # =========================================================
+      # STEP 9: Summary
+      # =========================================================
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "=========================================="
+          echo "🎉 DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+          echo "AMI ID:              ${{ steps.ami.outputs.AMI_ID }}"
+          echo "AMI Name:            ${{ steps.ami.outputs.AMI_NAME }}"
+          echo "LT New Version:      ${{ steps.newlt.outputs.NEW_VER }}"
+          echo "Instance Refresh ID: ${{ steps.refresh.outputs.REFRESH_ID }}"
+          echo "Commit:              ${{ github.sha }}"
+          echo "=========================================="
