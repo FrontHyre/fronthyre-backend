@@ -45,7 +45,7 @@ jobs:
             --output text)
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-      - name: Wait for instance to be running
+      - name: Wait for instance
         run: |
           aws ec2 wait instance-running --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
           aws ec2 wait instance-status-ok --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
@@ -66,29 +66,25 @@ jobs:
           mkdir -p ~/.ssh
           echo "$SSH_KEY_CONTENT" > ~/.ssh/deploy-key.pem
           chmod 600 ~/.ssh/deploy-key.pem
-          ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H ${{ steps.ip.outputs.PUBLIC_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "SSH setup complete"
+          ls -la ~/.ssh/ | head
 
       - name: Deploy code to builder
         run: |
-          ssh -i ~/.ssh/deploy-key.pem -o StrictHostKeyChecking=no \
-            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
-            "cd ~/fronthyre-backend && \
-             git fetch origin && \
-             git reset --hard origin/main && \
-             npm install --omit=dev && \
-             (pm2 delete all || true) && \
-             pm2 start server.js --name frontyre-api && \
-             pm2 save && \
-             sleep 5 && \
-             curl -sf http://localhost:3000/health"
+          ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/deploy-key.pem \
+              ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
+              "cd ~/fronthyre-backend && git fetch origin && git reset --hard origin/main && npm install --omit=dev && (pm2 delete all || true) && pm2 start server.js --name frontyre-api && pm2 save && sleep 5 && curl -sf http://localhost:3000/health"
 
       - name: Stop builder for clean AMI
         run: |
-          ssh -i ~/.ssh/deploy-key.pem -o StrictHostKeyChecking=no \
-            ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
-            "sudo shutdown -h now" || true
+          ssh -o StrictHostKeyChecking=no \
+              -i ~/.ssh/deploy-key.pem \
+              ${{ secrets.SSH_USER }}@${{ steps.ip.outputs.PUBLIC_IP }} \
+              "sudo shutdown -h now" || true
           sleep 20
-          aws ec2 wait instance-stopped --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }}
+          aws ec2 wait instance-stopped --instance-ids ${{ steps.launch.outputs.INSTANCE_ID }} || true
 
       - name: Create new AMI
         id: ami
@@ -101,12 +97,13 @@ jobs:
             --query 'ImageId' \
             --output text)
           echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+          echo "Created AMI: $AMI_ID"
 
       - name: Wait for AMI
         run: |
           aws ec2 wait image-available --image-ids ${{ steps.ami.outputs.AMI_ID }}
 
-      - name: Get current Launch Template version
+      - name: Get current LT version
         id: lt
         run: |
           LATEST_VER=$(aws ec2 describe-launch-template-versions \
@@ -116,7 +113,7 @@ jobs:
             --output text)
           echo "LATEST_VER=$LATEST_VER" >> $GITHUB_OUTPUT
 
-      - name: Create new Launch Template version
+      - name: Create new LT version
         id: newlt
         run: |
           NEW_VER=$(aws ec2 create-launch-template-version \
